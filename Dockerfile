@@ -3,7 +3,7 @@
 # (Alpine would be smaller but swaps glibc for musl; for a service like this the conventional glibc base wins.)
 
 # ---- build stage: compile with the Maven wrapper (tests run in CI, not here, so they are not even compiled) ----
-FROM eclipse-temurin:21-jdk-noble AS build
+FROM eclipse-temurin:25-jdk-noble AS build
 WORKDIR /src
 COPY .mvn/ .mvn/
 COPY mvnw pom.xml ./
@@ -12,7 +12,7 @@ COPY src/ src/
 RUN ./mvnw -B -q -Dmaven.test.skip=true package && cp target/ledger-system-*.jar /app.jar
 
 # ---- runtime stage: JRE only, non-root ----
-FROM eclipse-temurin:21-jre-noble
+FROM eclipse-temurin:25-jre-noble
 # Regular (non-system) user with a high uid, so it can never collide with a host account under Kubernetes runAsNonRoot.
 RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin ledger
 USER ledger
