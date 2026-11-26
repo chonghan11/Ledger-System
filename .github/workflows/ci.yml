@@ -82,7 +82,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ledger-jar
           path: target
