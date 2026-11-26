@@ -1,0 +1,31 @@
+spring:
+  application:
+    name: ledger-system
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/ledger}
+    username: ${DB_USER:ledger}
+    password: ${DB_PASSWORD:ledger}
+  flyway:
+    enabled: true
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+    deserialization:
+      # Money is integer minor units. Without this, Jackson silently truncates 12.5 -> 12.
+      accept-float-as-int: false
+      fail-on-unknown-properties: true
+    mapper:
+      # Reject "amount": "100" (string) instead of coercing it.
+      allow-coercion-of-scalars: false
+
+server:
+  port: ${PORT:8080}
+
+ledger:
+  # Incoming transfers are held (not spendable) for this long. During the hold a
+  # reversal is guaranteed to succeed. Set to PT0S to disable holds.
+  hold-period: PT10M
+  reconciliation:
+    # Runs the previous month's reconciliation at 00:05 UTC on the 1st of each month.
+    auto-run: true
+    cron: "0 5 0 1 * *"

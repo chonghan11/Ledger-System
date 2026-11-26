@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ledger</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">Ledger <span class="muted">double-entry · integer minor units</span></div>
+  <button id="health-pill" class="pill" title="Run the integrity check">checking…</button>
+</header>
+
+<main class="layout">
+  <!-- ============ LEFT: accounts ============ -->
+  <section class="col-left">
+    <div class="card">
+      <div class="card-head">
+        <h2>Accounts</h2>
+        <label class="toggle"><input type="checkbox" id="show-system"> system accounts</label>
+      </div>
+      <table class="table accounts">
+        <thead><tr><th>Name</th><th class="num">Balance</th><th class="num">Available</th></tr></thead>
+        <tbody id="accounts-body"></tbody>
+      </table>
+      <p id="accounts-empty" class="empty hidden">No accounts yet. Create one below.</p>
+    </div>
+
+    <div class="card">
+      <h2>New account</h2>
+      <form id="create-form" class="form-row">
+        <input name="name" placeholder="Name" maxlength="100" required>
+        <select name="currency" id="create-currency"></select>
+        <button type="submit">Create</button>
+      </form>
+    </div>
+  </section>
+
+  <!-- ============ RIGHT: selected account ============ -->
+  <section class="col-right">
+    <div id="notice" class="notice hidden"></div>
+
+    <div id="no-selection" class="card empty-card">
+      <p>Select an account to see its balance, move money and view its history.</p>
+    </div>
+
+    <div id="detail" class="hidden">
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <h2 id="d-name"></h2>
+            <div class="muted mono small" id="d-id"></div>
+          </div>
+          <span class="tag" id="d-currency"></span>
+        </div>
+        <div class="balances">
+          <div><div class="label">Balance</div><div class="big mono" id="d-balance"></div></div>
+          <div><div class="label">Available</div><div class="big mono" id="d-available"></div></div>
+          <div><div class="label">On hold</div><div class="big mono held" id="d-held"></div></div>
+        </div>
+      </div>
+
+      <div class="card" id="actions-card">
+        <div class="tabs" role="tablist">
+          <button class="tab active" data-tab="transfer">Transfer</button>
+          <button class="tab" data-tab="deposit">Deposit</button>
+          <button class="tab" data-tab="withdraw">Withdraw</button>
+        </div>
+
+        <form id="transfer-form" class="action-form" data-panel="transfer">
+          <label>To
+            <select name="to" required></select>
+          </label>
+          <label>Amount <span class="muted small" data-ccy></span>
+            <input name="amount" inputmode="decimal" placeholder="0.00" autocomplete="off" required>
+          </label>
+          <label>Description
+            <input name="description" maxlength="255" placeholder="optional">
+          </label>
+          <div class="fx-preview muted small" id="fx-preview"></div>
+          <button type="submit">Send transfer</button>
+        </form>
+
+        <form id="deposit-form" class="action-form hidden" data-panel="deposit">
+          <label>Amount <span class="muted small" data-ccy></span>
+            <input name="amount" inputmode="decimal" placeholder="0.00" autocomplete="off" required>
+          </label>
+          <label>Description
+            <input name="description" maxlength="255" placeholder="optional">
+          </label>
+          <button type="submit">Deposit</button>
+        </form>
+
+        <form id="withdraw-form" class="action-form hidden" data-panel="withdraw">
+          <label>Amount <span class="muted small" data-ccy></span>
+            <input name="amount" inputmode="decimal" placeholder="0.00" autocomplete="off" required>
+          </label>
+          <label>Description
+            <input name="description" maxlength="255" placeholder="optional">
+          </label>
+          <button type="submit">Withdraw</button>
+        </form>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>History</h2>
+          <span class="muted small">oldest first · click a row to see its double-entry legs</span>
+        </div>
+        <table class="table history">
+          <thead>
+          <tr><th>Time</th><th>Type</th><th>Details</th><th class="num">Amount</th><th class="num">Running</th><th></th></tr>
+          </thead>
+          <tbody id="history-body"></tbody>
+        </table>
+        <p id="history-empty" class="empty hidden">No transactions yet.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ BOTTOM: operations ============ -->
+  <section class="col-full ops">
+    <div class="card">
+      <div class="card-head">
+        <h2>Ledger integrity</h2>
+        <button id="integrity-run" class="secondary">Run check</button>
+      </div>
+      <div id="integrity-progress" class="progress hidden" role="progressbar" aria-label="Running integrity check"></div>
+      <div id="integrity-out" class="muted small">Not run yet.</div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>Month-end reconciliation</h2>
+        <form id="recon-form" class="form-row inline">
+          <input type="month" name="period" required>
+          <button type="submit" class="secondary">Reconcile</button>
+        </form>
+      </div>
+      <div id="recon-out" class="muted small">Pick a month that has ended. The first run of a month is its official close.</div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>Exchange rates</h2>
+        <form id="rate-form" class="form-row inline">
+          <select name="base"></select><span class="muted">→</span><select name="quote"></select>
+          <input name="rate" placeholder="1.345" size="10" required>
+          <button type="submit" class="secondary">Set</button>
+        </form>
+      </div>
+      <table class="table rates">
+        <thead><tr><th>Pair</th><th class="num">Rate</th><th>Updated</th></tr></thead>
+        <tbody id="rates-body"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
