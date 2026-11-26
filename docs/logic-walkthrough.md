@@ -1,6 +1,6 @@
 # Ledger logic walkthrough
 
-This is a companion to the README. The README says *what* the system does and *why*. This document traces *exactly how* it does it, with real numbers, so a reader can follow every line of the posting path and see why it is correct.
+This is a companion to the README. The README says *what* the system does and *why*. This document traces *exactly how* it does it, with real numbers, so readers can follow every line of the posting path and see why it is correct.
 
 Conventions used below:
 
@@ -149,7 +149,7 @@ Once the hold has expired, the original credit no longer counts as held, so the 
 |---|---|---|---|---|
 | B | `-500 (-5.00 USD)` | `50 (0.50)` | `-450` | held 0; −450 < 0, **422 INSUFFICIENT_FUNDS** ("available 50, 500 required") |
 
-Everything rolls back: A stays at 500 and B at 50. The ledger never forces a customer negative. A real system would recover the money outside the ledger (README §6).
+Everything rolls back: A stays at 500 and B at 50. The ledger never forces a customer negative. A real system would recover the money outside the ledger (README §7).
 
 ### 2.7 Idempotent replay
 

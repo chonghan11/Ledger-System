@@ -21,31 +21,45 @@ All six "system behaviours" from the brief are implemented and tested, plus one 
 ## Contents
 1. [Quick start](#1-quick-start)
 2. [API](#2-api)
-3. [Core design: double-entry](#3-core-design-double-entry)
-4. [The algorithms, behaviour by behaviour](#4-the-algorithms-behaviour-by-behaviour)
-5. [Assumptions](#5-assumptions)
-6. [Trade-offs and what I'd do next](#6-trade-offs-and-what-id-do-next)
-7. [Testing](#7-testing)
-8. [Project layout](#8-project-layout)
+3. [Decisions made](#3-decisions-made)
+4. [Core design: double-entry](#4-core-design-double-entry)
+5. [The algorithms, behaviour by behaviour](#5-the-algorithms-behaviour-by-behaviour)
+6. [Assumptions](#6-assumptions)
+7. [Trade-offs and what I'd do next](#7-trade-offs-and-what-id-do-next)
+8. [Testing](#8-testing)
+9. [Project layout](#9-project-layout)
 
 ---
 
 ## 1. Quick start
 
-**Prerequisites:** JDK 21 and Docker. Maven is *not* required; the repo ships the Maven wrapper.
+**Prerequisites:** JDK 21 (`java` on the PATH or `JAVA_HOME` set) and Docker, **running**. Maven is *not* required: the repo ships the Maven wrapper, which downloads the right Maven version on first use. Ports 5432 and 8080 must be free.
 
+**macOS / Linux / Git Bash:**
 ```bash
 docker compose up -d          # PostgreSQL 17 on localhost:5432 (db/user/password: ledger)
-./mvnw spring-boot:run        # Windows: mvnw.cmd spring-boot:run  ->  http://localhost:8080
+./mvnw spring-boot:run        # builds and starts the app -> http://localhost:8080
 ./mvnw test                   # 78 tests; Testcontainers starts its own throwaway Postgres
 ```
+
+**Windows PowerShell** (the default terminal in VS Code):
+```powershell
+docker compose up -d
+.\mvnw.cmd spring-boot:run
+.\mvnw.cmd test
+```
+
+Tips:
+- **First run is slower:** the wrapper downloads Maven and the project's libraries (a few minutes, once).
+- **`spring-boot:run` keeps the terminal busy** while the app runs (stop it with Ctrl+C). Run the tests in a **second terminal**, or before starting the app.
+- **The tests don't need the `docker compose` database**: they start their own throwaway Postgres. Docker must still be running.
 
 Flyway creates the schema on startup. That includes the system accounts (one `EXTERNAL` and one `FX` per currency) and a seed set of exchange rates.
 
 **Web UI:** open **http://localhost:8080/**. It's a deliberately thin page with plain HTML/JS, no framework or build step, served by the same Spring Boot app. All rules live in the backend; the page only turns what you type into integer minor units, by string parsing and never `parseFloat`, and shows the API's responses and error codes. What it covers:
 - **Accounts:** a list showing balance / available / on-hold, with system accounts behind a toggle. Create accounts; deposit, withdraw and transfer.
 - **Transfers:** a cross-currency preview using the same integer half-even maths as the server. A **"Send same request again"** button resends the last request with the same `Idempotency-Key`, so you can watch the server replay it without moving money.
-- **History:** running balance and hold countdowns, plus a **Reverse** button on your own *outgoing* transfers (only the sender can take money back; see §4.6). Click a row to see its double-entry legs and their per-currency net of 0.
+- **History:** running balance and hold countdowns, plus a **Reverse** button on your own *outgoing* transfers (only the sender can take money back; see §5.6). Click a row to see its double-entry legs and their per-currency net of 0.
 - **Operations:** integrity check (also shown as the header badge), month-end reconciliation and exchange rates.
 
 Balances refresh every 10 seconds, so you can watch holds expire.
@@ -107,7 +121,42 @@ All errors are [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) `application/p
 
 ---
 
-## 3. Core design: double-entry
+## 3. Decisions made
+
+The main choices in one place. Each is explained in more detail in the section it points to.
+
+| Area | Decision | Why | Alternative considered |
+|---|---|---|---|
+| **Language** | Java 21 + Spring Boot 3.5 | The brief prefers Java; `@Transactional` and mature JDBC suit a ledger | Python (FastAPI): less code, but transactions are managed by hand |
+| **Database** | PostgreSQL 17 | ACID transactions, row-level locks, `CHECK`/`UNIQUE` constraints and triggers | In-memory / H2: locks behave differently, so concurrency tests would prove little |
+| **Data access** | Plain SQL with `JdbcClient` | The locking query and the aggregates *are* the logic, so they stay visible; no ORM caching | JPA / Hibernate (§4) |
+| **Money** | `long` integer minor units; JSON floats rejected | Rounding errors are impossible; overflow throws instead of wrapping | `double` (inexact); `BigDecimal` (exact, but slower and easy to misuse) |
+| **Bookkeeping** | Double-entry: each transaction's entries sum to 0 per currency, with `EXTERNAL` and `FX` system accounts | Money can't be created or destroyed, and the books can be verified at any time | Updating two balances directly: nothing to check them against |
+| **Balances** | Entries are the source of truth; `accounts.balance` is a cache updated in the same transaction | O(1) reads and funds checks, and the cache is verifiable | Summing all entries on every read |
+| **History** | Append-only (enforced by DB triggers); corrections are new transactions | A complete audit trail | Editing or deleting rows |
+| **Concurrency** | Pessimistic row locks (`FOR NO KEY UPDATE`), always taken in ascending account-id order | Busy accounts queue instead of failing; the fixed order prevents deadlocks; this lock mode doesn't block month-end checks | Optimistic versioning + retry: retry storms on busy accounts (§5.2) |
+| **Posting time** | Server clock (UTC), read *after* the locks are held | History and month-end buckets follow the order postings were really applied | Reading the clock on arrival, a bug found in review (§5.1) |
+| **Idempotency** | Required client `Idempotency-Key`, stored as a primary key in the same DB transaction as the money; only successes are remembered | Retries never pay twice; the database referees races; a failed request can be retried | A separate cache such as Redis (not atomic with the money); remembering failures |
+| **Key reuse** | Same key + different request → `422` | Follows the IETF Idempotency-Key draft | Silently replaying or executing it |
+| **Reversals** | A new negating transaction, at most once (`UNIQUE`); a reversal can't itself be reversed | History is never edited; a double reversal is impossible | Editing or deleting the original |
+| **Spent money** | A reversal is rejected if the recipient no longer has the money | Customers never go negative | Allowing a negative balance as a receivable (§7) |
+| **Hold period** | Incoming transfers held 10 minutes (configurable), calculated when read, with no release job | A reversal during the hold always succeeds; no background job can fail or double-release | No hold; a scheduled release job (§5.7) |
+| **What isn't held** | Deposits and reversal credits are available immediately | Deposits arrive already cleared; returned money was the sender's own | Holding everything |
+| **Who may reverse** | The sender (the UI shows Reverse only on outgoing transfers); deposits and withdrawals by operators via the API | Matches a bank recall; a recipient returns money with a normal transfer | Letting either side reverse (§5.6) |
+| **FX booking** | Four legs through per-currency FX clearing accounts | Each currency still nets to 0, and the bank's currency position is visible | Two legs (−USD, +SGD): breaks the per-currency balance (§5.5) |
+| **FX maths** | Rate × 10⁸ stored as an integer, `BigInteger` maths, one half-even rounding step | Exact, and unbiased over many conversions | Floating point; half-up rounding, which drifts upward |
+| **FX rates** | Directional pairs, no triangulation; reversals negate the original legs | Matches how dealers quote; the sender gets back exactly what they sent | Inverting rates; re-converting at today's rate |
+| **Amounts** | Stated in the source account's currency (which must be given); 0 < amount ≤ 10¹⁵ | Prevents confusion over which side the amount refers to; keeps every sum far from overflow | An implicit currency; unbounded amounts |
+| **Integrity check** | Re-derives every invariant from the entries in one REPEATABLE READ snapshot | A single coherent picture even under live traffic | Trusting the cached balances (§5.4) |
+| **Month-end** | The first run of a month is its official close (unique index); re-runs and the next month are compared against it; 5-minute grace period | Re-running can't launder back-dated changes; postings in flight at midnight are included | Using the latest run as the reference, a bug found in review (§5.8) |
+| **Errors** | RFC 9457 problem+json with a stable `code` | Clients branch on codes, never on messages | Ad-hoc error bodies |
+| **Testing** | Testcontainers on real PostgreSQL; concurrency tests released together by a latch | Proves the locking really works | Mocks or H2 (§8) |
+| **UI** | One plain HTML/JS page served by Spring Boot; all rules stay in the backend; SGD pre-selected | No build step, nothing to drift out of sync with the API | A separate single-page-app framework |
+| **Delivery** | GitHub Actions (tests, static checks, smoke test, image); Docker on Ubuntu-based Temurin, pinned and non-root | Conventional, reproducible defaults | Alpine: smaller, but swaps glibc for musl |
+
+---
+
+## 4. Core design: double-entry
 
 Everything else builds on this.
 
@@ -129,7 +178,7 @@ entries       id (BIGSERIAL), transaction_id, account_id, amount (signed), curre
 - A **transaction** is the business event. Its **entries** are the actual postings.
 - The sign convention is deliberately simple: a positive amount increases the account's balance, a negative one decreases it.
 - **Invariant:** for every transaction, the entries of each currency sum to **zero**. Money is never created or destroyed, only moved.
-- **Money from outside** enters through a per-currency `EXTERNAL` system account, which goes negative by exactly what customers deposited. So even deposits balance, and "total money in the ledger" becomes something you can check (see §4.4).
+- **Money from outside** enters through a per-currency `EXTERNAL` system account, which goes negative by exactly what customers deposited. So even deposits balance, and "total money in the ledger" becomes something you can check (see §5.4).
 
 ```
 Deposit 100 USD to Alice          Transfer 30 USD Alice -> Bob
@@ -138,7 +187,7 @@ Deposit 100 USD to Alice          Transfer 30 USD Alice -> Bob
 ```
 
 ### Source of truth vs. cache
-`entries` is the **source of truth**. `accounts.balance` is a **cache** of `SUM(entries.amount)`, updated in the same database transaction as the entries. The cache exists so that balance reads and the insufficient-funds check are O(1) instead of summing the account's whole history. Because it's a cache, the integrity check (§4.4) verifies it against the entries.
+`entries` is the **source of truth**. `accounts.balance` is a **cache** of `SUM(entries.amount)`, updated in the same database transaction as the entries. The cache exists so that balance reads and the insufficient-funds check are O(1) instead of summing the account's whole history. Because it's a cache, the integrity check (§5.4) verifies it against the entries.
 
 ### History is append-only
 Database triggers reject `UPDATE`/`DELETE` on `entries` and `transactions`. Mistakes are fixed by posting new transactions (reversals), never by editing history, so the audit trail is complete by construction.
@@ -155,17 +204,17 @@ In a ledger, the locking query and every aggregate are the logic, so they should
 
 ---
 
-## 4. The algorithms, behaviour by behaviour
+## 5. The algorithms, behaviour by behaviour
 
-### 4.1 Atomic transfer (`PostingEngine`)
+### 5.1 Atomic transfer (`PostingEngine`)
 
 Every money movement (deposit, withdrawal, transfer, FX transfer, reversal) is expressed as a list of **legs** (`account, signed amount, available_at`) and goes through one method. It all happens in **one database transaction**:
 
 ```
 BEGIN
- 1. claim the idempotency key                                   (§4.3)
+ 1. claim the idempotency key                                   (§5.3)
  2. read immutable account facts (currency, type)               -> decide which accounts are involved
- 3. LOCK all involved accounts: SELECT … FOR NO KEY UPDATE, in ascending id order   (§4.2)
+ 3. LOCK all involved accounts: SELECT … FOR NO KEY UPDATE, in ascending id order   (§5.2)
  4. read the clock: this is the posting time                     (only now, with every lock held)
  5. check legs: every currency nets to zero                      (else a programming error)
  6. funds check: for each customer account being debited,
@@ -180,7 +229,7 @@ COMMIT   (any exception at any step -> ROLLBACK: nothing happened)
 
 Atomicity comes from the database: Spring's `@Transactional` opens one Postgres transaction for the whole method, and any `RuntimeException` rolls back every write. The engine's methods use `Propagation.MANDATORY`, so calling them outside a transaction fails immediately instead of silently auto-committing step by step.
 
-### 4.2 Concurrency: no lost updates, no deadlocks
+### 5.2 Concurrency: no lost updates, no deadlocks
 
 **The danger.** Two transfers out of the same account, each with 100 available and each sending 80: both read 100, both pass the check, both write. One update is lost, or the account ends at −60.
 
@@ -198,7 +247,7 @@ Atomicity comes from the database: Spring's `@Transactional` opens one Postgres 
 - 200 opposing transfers (A→B and B→A at once) → no deadlocks, money conserved.
 - 60 opposing cross-currency transfers → every currency still balances.
 
-### 4.3 Idempotency: repeated requests don't repeat transfers
+### 5.3 Idempotency: repeated requests don't repeat transfers
 
 The client sends an `Idempotency-Key` header, required on every money-moving `POST`. Inside the **same** database transaction as the transfer:
 
@@ -219,7 +268,7 @@ ON CONFLICT (idempotency_key) DO NOTHING
 
 **Reversals** need no key: they're naturally idempotent, since `UNIQUE(reverses_id)` means a second attempt returns `409 ALREADY_REVERSED` with the existing reversal's id.
 
-### 4.4 Integrity check: does the money add up?
+### 5.4 Integrity check: does the money add up?
 
 `GET /admin/integrity-check` re-derives everything from first principles and lists every violation:
 
@@ -234,7 +283,7 @@ ON CONFLICT (idempotency_key) DO NOTHING
 
 **Consistent snapshot.** The check runs in a single **REPEATABLE READ** transaction, so all its queries see the ledger at the same instant while transfers keep committing. To be precise: each check is one SQL statement, and Postgres already reads a single statement from one snapshot, so no individual check can be fooled by an in-flight transfer. REPEATABLE READ adds consistency *across* the statements, so the totals, per-account results and counts in the report all describe the same moment. Tests corrupt the database directly with raw SQL (drifting a cached balance, inserting a one-legged transaction) and assert each is detected.
 
-### 4.5 Multi-currency transfers
+### 5.5 Multi-currency transfers
 
 `amount` is always in the **source** account's currency, and `currency` must match it. This guards against a client mixing up which side the amount refers to.
 
@@ -257,7 +306,7 @@ The FX accounts hold the ledger's currency position: it now has 100 USD more and
 
 **Rates are directional** (USD→SGD and SGD→USD are separate rows, as real desks quote them with a spread). There's **no triangulation**: a missing pair is rejected (`FX_RATE_UNAVAILABLE`) rather than guessed through a third currency.
 
-### 4.6 Reversals
+### 5.6 Reversals
 
 `POST /transactions/{id}/reversal` posts a **new** `REVERSAL` transaction whose entries are the exact negation of the original's, with `reverses_id` pointing back. The original is never modified; its view shows `status: REVERSED` and `reversedByTransactionId`.
 
@@ -266,9 +315,9 @@ The FX accounts hold the ledger's currency position: it now has 100 USD more and
 - **A reversal can't be reversed**: post a new transfer instead. That keeps the "reversed by" chain one level deep and unambiguous.
 - Deposits and withdrawals can be reversed too (e.g. a chargeback, or an ATM that failed to pay out).
 
-**Who may reverse.** A reversal is the *sender* taking money back, like a bank recall, so the UI offers **Reverse** only on a customer's own outgoing transfers. A recipient who wants to return money sends an ordinary transfer, which is a new payment rather than a correction. Reversing deposits and withdrawals is a back-office correction: the API supports it (and it's tested), but customers aren't offered it. The API itself has no authentication in this take-home, so `POST /transactions/{id}/reversal` acts as an operator endpoint. In production, the authorisation layer would enforce the same rule: a customer may reverse only transactions where their account is the source, and only operators may reverse deposits, withdrawals or anything else (see §6, *Admin surface*).
+**Who may reverse.** A reversal is the *sender* taking money back, like a bank recall, so the UI offers **Reverse** only on a customer's own outgoing transfers. A recipient who wants to return money sends an ordinary transfer, which is a new payment rather than a correction. Reversing deposits and withdrawals is a back-office correction: the API supports it (and it's tested), but customers aren't offered it. The API itself has no authentication in this take-home, so `POST /transactions/{id}/reversal` acts as an operator endpoint. In production, the authorisation layer would enforce the same rule: a customer may reverse only transactions where their account is the source, and only operators may reverse deposits, withdrawals or anything else (see §7, *Admin surface*).
 
-### 4.7 The hold period (the addition)
+### 5.7 The hold period (the addition)
 
 The open question in a reversal is: *what if the recipient has already spent the money?* Rather than allowing negative balances, incoming transfers are **held for 10 minutes** (configurable via `ledger.hold-period`; `PT0S` turns holds off).
 
@@ -286,7 +335,7 @@ The open question in a reversal is: *what if the recipient has already spent the
 - **All time comes from an injectable `Clock`**, so tests move time forward ("11 minutes later") instantly.
 - **The boundary is inclusive of release:** money is spendable at exactly `created_at + hold` (tested to the second).
 
-### 4.8 Month-end reconciliation
+### 5.8 Month-end reconciliation
 
 `POST /admin/reconciliations {"period":"2026-10"}` (also runs automatically at 00:05 UTC on the 1st, for the previous month). For every account that existed by month end:
 
@@ -312,12 +361,12 @@ It then cross-checks:
 
 Other details:
 - **Grace period:** a month can only be reconciled 5 minutes after it ends (UTC); `PERIOD_NOT_CLOSED` otherwise. A posting stamped 23:59:59.9 may still be committing at midnight, and the grace period guarantees it's included. The scheduler runs at 00:05 for the same reason.
-- **Snapshot:** like the integrity check, it runs in one REPEATABLE READ snapshot, so live traffic causes no false alarms. Thanks to the `FOR NO KEY UPDATE` lock (§4.2), live traffic can't make it fail either. `ReconciliationConcurrencyTest` runs it 20 times while deposits keep committing.
+- **Snapshot:** like the integrity check, it runs in one REPEATABLE READ snapshot, so live traffic causes no false alarms. Thanks to the `FOR NO KEY UPDATE` lock (§5.2), live traffic can't make it fail either. `ReconciliationConcurrencyTest` runs it 20 times while deposits keep committing.
 - **Bucketing:** months are bucketed by entry `created_at` in UTC. An entry at exactly `00:00:00Z` on the 1st belongs to the new month (tested).
 
 ---
 
-## 5. Assumptions
+## 6. Assumptions
 
 - **Amounts in minor units**, `0 < amount ≤ 10¹⁵` (10 trillion USD). The cap is far above any real payment. It keeps every balance and aggregate well inside a 64-bit integer, so extreme input gets a clean 400 instead of an overflow. `amount` is in the **source** currency, and `currency` must match it. Currency codes are case-insensitive (`usd` = `USD`).
 - **Blank text** (`description`, `reason`) is treated as absent, so `""` and a missing field are the same request for idempotency purposes.
@@ -331,7 +380,7 @@ Other details:
 
 ---
 
-## 6. Trade-offs and what I'd do next
+## 7. Trade-offs and what I'd do next
 
 | Topic | Current choice | At larger scale |
 |---|---|---|
@@ -355,7 +404,7 @@ Other details:
 
 ---
 
-## 7. Testing
+## 8. Testing
 
 ```bash
 ./mvnw test
@@ -400,10 +449,10 @@ docker build -t ledger . && docker run -p 8080:8080 --network ledger-system_defa
 ```
 
 ### Review process
-Once the first version passed its tests, it went through two independent read-only reviews: one hunting for bugs, one for edge cases. Both independently found the most important issue: the **posting time was read before waiting for locks** (§4.1). The bug review also found that **re-running a tampered month could re-freeze it** (§4.8). The edge-case review found smaller gaps: overflow returning raw 500s, a missing `GET /fx-rates/{base}/{quote}`, Unicode-whitespace names, inconsistent currency case, and rates with trailing zeros being rejected. Each was fixed with a regression test.
+Once the first version passed its tests, it went through two independent read-only reviews: one hunting for bugs, one for edge cases. Both independently found the most important issue: the **posting time was read before waiting for locks** (§5.1). The bug review also found that **re-running a tampered month could re-freeze it** (§5.8). The edge-case review found smaller gaps: overflow returning raw 500s, a missing `GET /fx-rates/{base}/{quote}`, Unicode-whitespace names, inconsistent currency case, and rates with trailing zeros being rejected. Each was fixed with a regression test.
 
 A second round ran three more independent reviews in parallel:
-- **Logic audit against the brief and this README.** It traced eight scenarios by hand and confirmed all six behaviours. It predicted the reconciliation failure under live traffic, which `ReconciliationConcurrencyTest` reproduced before it was fixed with `FOR NO KEY UPDATE` (§4.2). It also prompted the unique official-close index (§4.8).
+- **Logic audit against the brief and this README.** It traced eight scenarios by hand and confirmed all six behaviours. It predicted the reconciliation failure under live traffic, which `ReconciliationConcurrencyTest` reproduced before it was fixed with `FOR NO KEY UPDATE` (§5.2). It also prompted the unique official-close index (§5.8).
 - **Edge-case tests.** `EdgeCaseLogicTest` and `ZeroHoldTest` found no further bugs.
 - **Dead code and performance.** Removed an unused method, an unused config record and two unused test dependencies. The integrity check now sums entries in one pass instead of once per currency. The Docker build no longer compiles tests. The UI no longer runs the full integrity check on its 10-second timer.
 
@@ -411,7 +460,7 @@ A second round ran three more independent reviews in parallel:
 
 ---
 
-## 8. Project layout
+## 9. Project layout
 
 ```
 src/main/java/com/ledger/
